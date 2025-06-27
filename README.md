@@ -1,1 +1,1 @@
-bash -c "$(curl -L https://github.com/mgelioo/server-setup/blob/main/setup.sh)" @ install
+bash -c "$(curl -L https://raw.githubusercontent.com/mgelioo/server-setup/main/setup.sh)" @ install
