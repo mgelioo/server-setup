@@ -157,7 +157,7 @@ echo "----------------------------------------"
 # --- Step 6: Configure Nginx and obtain SSL Certificate ---
 echo "## Step 6: Configuring Nginx and obtaining SSL certificate..."
 
-read -p "Enter your Nginx server name (e.g., sub.domain.com): " SERVER_NAME
+read -p "Enter your Nginx server name (e.g., farhad.marfanet.com): " SERVER_NAME
 if [ -z "$SERVER_NAME" ]; then
     echo "Server name cannot be empty. Aborting Nginx configuration."
     exit 1
@@ -187,12 +187,13 @@ echo "SSL certificate issued for $SERVER_NAME."
 
 echo "## Step 6.4: Installing SSL certificate to Nginx config paths..."
 # Install certificate to the specified paths, these paths will be used in Nginx config
+# Removed --reloadcmd here because Nginx service is not yet defined by systemd at this point.
+# Nginx will be started correctly in Step 7 and pick up the certs then.
 acme.sh --install-cert -d "$SERVER_NAME" --ecc \
 --key-file "$ACME_CERT_KEY_PATH" \
---fullchain-file "$ACME_FULLCHAIN_CERT_PATH" \
---reloadcmd "systemctl reload nginx" || { echo "Error: Failed to install SSL certificate. Check paths and permissions."; exit 1; }
+--fullchain-file "$ACME_FULLCHAIN_CERT_PATH" || { echo "Error: Failed to install SSL certificate. Check paths and permissions."; exit 1; }
 echo "SSL certificate installed to $ACME_CERT_KEY_PATH and $ACME_FULLCHAIN_CERT_PATH."
-echo "acme.sh will handle auto-renewal via cron."
+echo "acme.sh will handle auto-renewal via cron (which will trigger Nginx reload on renewal)."
 
 # Create Nginx log directory if it doesn't exist
 mkdir -p "$NGINX_LOG_DIR" || { echo "Error: Could not create Nginx log directory."; exit 1; }
@@ -243,7 +244,7 @@ http {
     gzip_vary on;
     gzip_proxied any;
     gzip_comp_level 6;
-    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript image/svg+xml;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml+rss text/javascript image/svg+xml;
 
     # ---- Global SSL/TLS Settings ----
     ssl_protocols TLSv1.2 TLSv1.3; # Require TLS 1.3 for HTTP/3
@@ -838,8 +839,6 @@ function list_users {
                 elif [ "$hours" -gt 0 ]; then
                     time_left_display="${hours}h ${minutes}m"
                 elif [ "$minutes" -gt 0 ]; then
-                    time_left_display="${minutes}m"
-                else # Less than 1 minute remaining
                     time_left_display="<1m"
                 fi
             fi
