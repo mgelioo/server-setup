@@ -53,6 +53,7 @@ cat > "$XRAY_CONFIG_PATH" << 'EOF'
   "inbounds": [
     {
       "listen": "127.0.0.1",
+      "tag":"vless-in",
       "port": 2000,
       "protocol": "vless",
       "settings": {
