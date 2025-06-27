@@ -16,13 +16,12 @@ NGINX_LOG_DIR="/usr/local/nginx/logs"
 if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as root. Please use sudo."
     exit 1
-fi
-
+fi;
 echo "--- Starting full server setup ---"
 
 # --- Step 1: Update system ---
 echo "## Step 1: Updating system packages..."
-apt update -y || { echo "Error: apt update failed."; exit 1; }
+apt update -y || { echo "Error: apt update failed."; exit 1; };
 apt upgrade -y || { echo "Warning: apt upgrade failed, continuing..."; }
 echo "System update complete."
 echo "----------------------------------------"
@@ -38,7 +37,7 @@ echo "## Step 2.1: Configuring Xray with provided config.json..."
 # Create Xray log directory if it doesn't exist
 mkdir -p "$XRAY_LOG_DIR" || { echo "Error: Could not create Xray log directory."; exit 1; }
 
-# Xray config
+# Xray config - Using 'EOF' with quotes to prevent variable expansion inside
 cat > "$XRAY_CONFIG_PATH" << 'EOF'
 {
   "log": {
@@ -48,19 +47,19 @@ cat > "$XRAY_CONFIG_PATH" << 'EOF'
   },
   "inbounds": [
     {
-      "listen": "127.0.0.1", 
-      "port": 2000, 
+      "listen": "127.0.0.1",
+      "port": 2000,
       "protocol": "vless",
       "settings": {
         "clients": [
-          
+
         ],
         "decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
         "xhttpSettings": {
-          "path": "/xhttp7970" 
+          "path": "/xhttp7970"
         }
       },
       "sniffing": {
@@ -173,7 +172,7 @@ fi
 # Create Nginx log directory if it doesn't exist
 mkdir -p "$NGINX_LOG_DIR" || { echo "Error: Could not create Nginx log directory."; exit 1; }
 
-# Generate Nginx config with user inputs
+# Generate Nginx config with user inputs - Variables are expanded here
 cat > "$NGINX_CONF_PATH" << EOF
 # WARNING: Running worker processes as root is a major security risk!
 user root;
@@ -205,10 +204,10 @@ http {
     keepalive_timeout 65;
     types_hash_max_size 2048;
     server_tokens off; # Hide Nginx version
-# Define the 'main' log format (as requested for access_log)
-    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
-                     '$status $body_bytes_sent "$http_referer" '
-                     '"$http_user_agent" "$http_x_forwarded_for"';
+# Define the 'main' log format (as requested)
+    log_format main '\$remote_addr - \$remote_user [\$time_local] "\$request" '
+                     '\$status \$body_bytes_sent "\$http_referer" '
+                     '"\$http_user_agent" "\$http_x_forwarded_for"';
 
     # Access log location and format (as requested)
     access_log /usr/local/nginx/logs/access.log main; # Ensure this directory exists
@@ -302,6 +301,7 @@ echo "----------------------------------------"
 # --- Step 7: Nginx Systemd Service and start ---
 echo "## Step 7: Setting up Nginx Systemd service and starting Nginx..."
 
+# Nginx Service file - Using 'EOF' with quotes to prevent variable expansion inside
 cat > "$NGINX_SERVICE_PATH" << 'EOF'
 [Unit]
 Description=A high performance web server and a reverse proxy server
@@ -334,10 +334,10 @@ echo "Enabling Nginx service..."
 systemctl enable nginx.service || { echo "Error: systemctl enable nginx.service failed."; exit 1; }
 
 echo "Restarting Nginx service..."
-systemctl restart nginx || { echo "Error: systemctl restart nginx failed. Check Nginx error logs."; exit 1; }
+systemctl restart nginx || { echo "Error: systemctl restart nginx failed. Check Nginx error logs for details."; exit 1; }
 
 echo "Checking Nginx service status..."
-systemctl status nginx --no-pager || { echo "Warning: Nginx service status check failed."; }
+systemctl status nginx --no-pager || { echo "Warning: Nginx service status check failed. Please manually check 'systemctl status nginx'."; }
 echo "Nginx service setup complete."
 echo "----------------------------------------"
 
@@ -347,7 +347,7 @@ echo "## Step 8: Installing Xray User Manager script..."
 # Ensure the user database file exists
 touch "$XRAY_USER_DB_PATH" || { echo "Error: Could not create user database file."; exit 1; }
 
-# Write the Xray manager script
+# Write the Xray manager script - Using 'SCRIPTEOF' with quotes to prevent expansion
 cat > "$XRAY_MANAGER_SCRIPT_PATH" << 'SCRIPTEOF'
 #!/bin/bash
 
@@ -427,10 +427,10 @@ function restart_xray {
 # and populates the global ALL_USER_TRAFFIC_STATS array.
 function get_all_user_traffic_stats {
     echo "Fetching all user traffic statistics from Xray..."
-    
+
     # Reset the associative array before populating to ensure fresh data
     unset ALL_USER_TRAFFIC_STATS
-    declare -g -A ALL_USER_TRAFFIC_STATS 
+    declare -g -A ALL_USER_TRAFFIC_STATS
 
     # Query Xray API for all user traffic stats. Redirect stderr to /dev/null to suppress errors.
     local raw_stats=$(/usr/local/bin/xray api statsquery --server=127.0.0.1:10085 -pattern "user>>>.*>>>traffic.*" -reset=false 2>/dev/null)
@@ -442,7 +442,7 @@ function get_all_user_traffic_stats {
             type=$4;  # Extracts "uplink" or "downlink"
             bytes=$5; # Extracts the bytes string (e.g., " 12345")
             gsub(/ /, "", bytes); # Remove leading space from the bytes string
-            
+
             if (type == "uplink") {
                 uplink_bytes[user] += bytes;
             } else if (type == "downlink") {
@@ -543,10 +543,10 @@ function add_user {
 
     # Generate a new UUID for the user. Requires 'uuid-runtime' package (for uuidgen).
     new_uuid=$(uuidgen)
-    
+
     # Calculate expiration date as a Unix timestamp (seconds since epoch).
     expiration_timestamp=$(date -d "+$duration_days days" +%s)
-    
+
     echo "----------------------------------------"
     echo "Adding new user details:"
     echo "  Name: $client_name"
@@ -639,7 +639,7 @@ function delete_user {
     local temp_db=$(mktemp)
     grep -v "^$user_uuid_to_delete;" "$USER_DB" | sudo tee "$temp_db" > /dev/null
     sudo mv "$temp_db" "$USER_DB"
-    
+
     if grep -q "^$user_uuid_to_delete;" "$USER_DB"; then
         echo "Error: Failed to remove user '$client_name' from database."
     else
@@ -662,14 +662,14 @@ function deactivate_user {
         echo "No UUID entered. Aborting."
         return
     fi
-    
+
     # Retrieve user record from the database.
     user_record=$(grep "^$user_uuid;" "$USER_DB")
     if [ -z "$user_record" ]; then
         echo "Error: User with UUID $user_uuid not found in database."
         return
     fi
-    
+
     local user_status=$(echo "$user_record" | cut -d';' -f5)
     local client_name=$(echo "$user_record" | cut -d';' -f2)
 
@@ -698,7 +698,7 @@ function deactivate_user {
             # Decide here if you want to abort or continue updating DB despite config failure.
         fi
     fi
-    
+
     # 2. Update user status in the database to 'deactivated'.
     local temp_db=$(mktemp)
     # Use awk to find the line with the user's UUID and change its status field.
@@ -715,7 +715,7 @@ function activate_user {
     echo "Listing all users..."
     list_users # Show current users for selection, now faster.
     read -p "Enter the UUID of the user you want to ACTIVATE: " user_uuid
-    
+
     if [ -z "$user_uuid" ]; then
         echo "No UUID entered. Aborting."
         return
@@ -731,7 +731,7 @@ function activate_user {
     local user_status=$(echo "$user_record" | cut -d';' -f5)
     local client_name=$(echo "$user_record" | cut -d';' -f2)
     local user_uuid_from_db=$(echo "$user_record" | cut -d';' -f1) # Ensure we use the UUID from DB for jq.
-    
+
     # Check if the user is in a state that can be activated.
     if [ "$user_status" != "deactivated" ] && [ "$user_status" != "expired" ] && [ "$user_status" != "over_limit" ]; then
         echo "User '$client_name' is not in a deactivated/expired/over_limit state (Status: $user_status). Cannot activate."
@@ -761,7 +761,7 @@ function activate_user {
             fi
         fi
     fi
-    
+
     # 2. Update user status in the database back to 'active'.
     local temp_db=$(mktemp)
     awk -F';' -v uuid="$user_uuid" 'BEGIN{OFS=";"} {if ($1 == uuid) {$5="active"; print} else {print}}' "$USER_DB" | sudo tee "$temp_db" > /dev/null
@@ -779,21 +779,21 @@ function list_users {
     echo "--------------------------------------------------------------------------------------------------------------------------------------"
     printf "%-38s %-15s %-25s %-15s %-15s %-15s %-10s\n" "UUID" "Name" "Expires On" "Time Left" "Traffic Limit" "Traffic Used" "Status"
     echo "--------------------------------------------------------------------------------------------------------------------------------------"
-    
+
     if [ ! -s "$USER_DB" ]; then
         echo "No users found in the database."
         return
     fi
-    
+
     local current_time=$(date +%s)
-    
+
     # Optimize: Fetch all user traffic stats once before looping through users.
     get_all_user_traffic_stats
 
     # Read each user record from the database.
     while IFS=';' read -r uuid name expires_at limit status; do
         local expires_display=$(date -d @$expires_at '+%Y-%m-%d %H:%M:%S')
-        
+
         # --- Calculate Time Left ---
         local time_left_display=""
         local display_status="$status" # Default display status is the one from DB
@@ -824,7 +824,7 @@ function list_users {
         # --- Calculate Traffic Used ---
         local traffic_used_gb_display="N/A"
         local traffic_limit_gb_display="${limit}GB"
-        
+
         # Retrieve total traffic bytes from the pre-fetched global array
         local total_traffic_bytes=${ALL_USER_TRAFFIC_STATS["$name"]:-0} # Defaults to 0 if no stats for user
 
@@ -835,7 +835,7 @@ function list_users {
 
             if [ "$limit" -gt 0 ]; then # If a traffic limit is set (not 0/unlimited)
                 local limit_bytes=$((limit * 1073741824))
-                
+
                 if [ "$total_traffic_bytes" -ge "$limit_bytes" ]; then
                     # If active and over limit, update display_status
                     if [[ "$status" == "active" ]]; then
@@ -846,7 +846,7 @@ function list_users {
                 traffic_limit_gb_display="UNLIMITED"
             fi
         fi
-        
+
         # Print formatted user information.
         printf "%-38s %-15s %-25s %-15s %-15s %-15s %-10s\n" \
                "$uuid" "$name" "$expires_display" "$time_left_display" \
@@ -862,19 +862,19 @@ function list_users {
 # Can be run periodically (e.g., via cron job).
 function check_limits {
     echo "Running periodic check for expired users and traffic limits..."
-    
+
     local current_time=$(date +%s)
     local temp_db=$(mktemp) # Create a temporary file for database updates.
     local changes_made=false # Flag to indicate if Xray restart is needed.
 
     # Optimization: Fetch all user traffic stats once for efficiency in this function too.
-    get_all_user_traffic_stats 
+    get_all_user_traffic_stats
 
     # Read each user from the database.
     while IFS=';' read -r uuid name expires_at limit status; do
         local client_email="${name}"
         local original_status=$status # Store original status to detect changes.
-        
+
         local current_user_config_present=false
         # Check if the user's UUID is currently in the Xray config's clients list.
         if sudo jq -e '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients[] | select(.id == "'"$uuid"'"))' "$XRAY_CONFIG" > /dev/null; then
@@ -912,7 +912,7 @@ function check_limits {
         # OR if they are already in an inactive state (expired, over_limit, deactivated) but still in config.
         if [[ ("$original_status" == "active" && "$status" != "active") || \
               (("$status" == "expired" || "$status" == "over_limit" || "$status" == "deactivated") && "$current_user_config_present" == "true") ]]; then
-            
+
             echo "Removing user '$name' (UUID: $uuid) from Xray config due to status change or persistent inactive status."
             sudo jq '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients) |= map(select(.id != "'"$uuid"'"))' "$XRAY_CONFIG" > tmp.json && sudo mv tmp.json "$XRAY_CONFIG"
             if [ $? -eq 0 ]; then
@@ -922,7 +922,7 @@ function check_limits {
                 echo "Error: Failed to remove user '$name' from Xray config."
             fi
         fi
-        
+
         # Write the (potentially updated) user record to the temporary database file.
         echo "$uuid;$name;$expires_at;$limit;$status" >> "$temp_db"
 
@@ -930,7 +930,7 @@ function check_limits {
 
     # Overwrite the main user database with the updated temporary one.
     sudo mv "$temp_db" "$USER_DB"
-    
+
     if [ "$changes_made" = true ]; then
         restart_xray # Restart Xray if any config changes were made.
     else
@@ -1009,7 +1009,7 @@ do
             echo "Exiting Xray User Manager. Goodbye!"
             break # Exit the select loop
             ;;
-        *) echo "Invalid option $REPLY";; # Handle invalid input
+        *) echo "Invalid option \$REPLY";; # Handle invalid input
     esac
     echo # Newline for better readability after each action
 done
