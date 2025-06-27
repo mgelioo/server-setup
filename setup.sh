@@ -2,6 +2,7 @@
 
 # This script automates the setup of Xray with Nginx (HTTP/3 + QUIC)
 # and installs a user management script for Xray on Ubuntu 22.04.
+# It now includes automated Let's Encrypt SSL certificate issuance via acme.sh.
 
 # --- Global Variables ---
 XRAY_CONFIG_PATH="/usr/local/etc/xray/config.json"
@@ -11,6 +12,10 @@ NGINX_SERVICE_PATH="/etc/systemd/system/nginx.service"
 XRAY_MANAGER_SCRIPT_PATH="/usr/local/bin/xray-manager"
 XRAY_LOG_DIR="/var/log/xray"
 NGINX_LOG_DIR="/usr/local/nginx/logs"
+
+# Paths for ACME.sh generated certificates
+ACME_CERT_KEY_PATH="/etc/ssl/private/private.key"
+ACME_FULLCHAIN_CERT_PATH="/etc/ssl/private/fullchain.cer"
 
 # Ensure script is run as root
 if [ "$(id -u)" -ne 0 ]; then
@@ -106,6 +111,7 @@ echo "quictls/openssl cloned to /root/quictls."
 echo "----------------------------------------"
 
 echo "## Step 4: Installing Nginx build dependencies and downloading Nginx..."
+# socat and cron are included here for acme.sh
 apt-get install -y gcc g++ libpcre3 libpcre3-dev zlib1g zlib1g-dev openssl libssl-dev wget sudo make curl socat cron jq uuid-runtime bc qrencode || { echo "Error: Installing Nginx dependencies failed."; exit 1; }
 echo "Nginx build dependencies installed."
 
@@ -148,8 +154,8 @@ make install || { echo "Error: Nginx installation failed."; exit 1; }
 echo "Nginx installed to /usr/local/nginx."
 echo "----------------------------------------"
 
-# --- Step 6: Configure Nginx ---
-echo "## Step 6: Configuring Nginx with user inputs..."
+# --- Step 6: Configure Nginx and obtain SSL Certificate ---
+echo "## Step 6: Configuring Nginx and obtaining SSL certificate..."
 
 read -p "Enter your Nginx server name (e.g., farhad.marfanet.com): " SERVER_NAME
 if [ -z "$SERVER_NAME" ]; then
@@ -157,22 +163,42 @@ if [ -z "$SERVER_NAME" ]; then
     exit 1
 fi
 
-read -p "Enter the FULL path to your SSL certificate file (e.g., /etc/ssl/certs/mycert.pem): " SSL_CERT_PATH
-if [ -z "$SSL_CERT_PATH" ]; then
-    echo "SSL certificate path cannot be empty. Aborting Nginx configuration."
-    exit 1
-fi
+echo "## Step 6.1: Installing acme.sh..."
+# acme.sh installs to /root/.acme.sh by default
+curl https://get.acme.sh | sh || { echo "Error: acme.sh installation failed."; exit 1; }
+# Create symlink for easy access in PATH
+ln -s /root/.acme.sh/acme.sh /usr/local/bin/acme.sh || { echo "Warning: Could not create acme.sh symlink. You might need to use /root/.acme.sh/acme.sh directly."; }
+echo "acme.sh installed."
 
-read -p "Enter the FULL path to your SSL certificate KEY file (e.g., /etc/ssl/private/mykey.key): " SSL_KEY_PATH
-if [ -z "$SSL_KEY_PATH" ]; then
-    echo "SSL key path cannot be empty. Aborting Nginx configuration."
-    exit 1
-fi
+echo "## Step 6.2: Setting default CA to Let's Encrypt for acme.sh..."
+# Change to the acme.sh directory to ensure it finds its scripts
+cd /root/.acme.sh || { echo "Error: Could not change to acme.sh directory."; exit 1; }
+acme.sh --set-default-ca --server letsencrypt || { echo "Error: Failed to set default CA for acme.sh."; exit 1; }
+echo "acme.sh default CA set to Let's Encrypt."
+
+echo "## Step 6.3: Obtaining SSL certificate for $SERVER_NAME using acme.sh..."
+# Create the directory for SSL keys if it doesn't exist
+mkdir -p /etc/ssl/private || { echo "Error: Could not create /etc/ssl/private directory."; exit 1; }
+chmod 700 /etc/ssl/private || { echo "Error: Could not set permissions for /etc/ssl/private."; exit 1; }
+
+# Issue certificate using standalone mode (requires port 80 to be free, which it should be at this stage)
+acme.sh --issue -d "$SERVER_NAME" --standalone --keylength ec-256 || { echo "Error: Failed to issue SSL certificate for $SERVER_NAME. Check logs, ensure domain points to this server and port 80 is accessible."; exit 1; }
+echo "SSL certificate issued for $SERVER_NAME."
+
+echo "## Step 6.4: Installing SSL certificate to Nginx config paths..."
+# Install certificate to the specified paths, these paths will be used in Nginx config
+acme.sh --install-cert -d "$SERVER_NAME" --ecc \
+--key-file "$ACME_CERT_KEY_PATH" \
+--fullchain-file "$ACME_FULLCHAIN_CERT_PATH" \
+--reloadcmd "systemctl reload nginx" || { echo "Error: Failed to install SSL certificate. Check paths and permissions."; exit 1; }
+echo "SSL certificate installed to $ACME_CERT_KEY_PATH and $ACME_FULLCHAIN_CERT_PATH."
+echo "acme.sh will handle auto-renewal via cron."
 
 # Create Nginx log directory if it doesn't exist
 mkdir -p "$NGINX_LOG_DIR" || { echo "Error: Could not create Nginx log directory."; exit 1; }
 
 # Generate Nginx config with user inputs - Variables are expanded here
+# SSL certificate paths are now hardcoded to ACME_FULLCHAIN_CERT_PATH and ACME_CERT_KEY_PATH
 cat > "$NGINX_CONF_PATH" << EOF
 # WARNING: Running worker processes as root is a major security risk!
 user root;
@@ -231,8 +257,8 @@ http {
     # OCSP Stapling (Improves TLS handshake speed and privacy)
     ssl_stapling on;
     ssl_stapling_verify on;
-    # IMPORTANT: Your trusted certificate chain
-    ssl_trusted_certificate ${SSL_CERT_PATH};
+    # IMPORTANT: Your trusted certificate chain - points to the fullchain file
+    ssl_trusted_certificate ${ACME_FULLCHAIN_CERT_PATH};
 # Provide DNS resolvers for OCSP lookup (e.g., Google's or your local ones)
     resolver 8.8.8.8 8.8.4.4 valid=300s;
     resolver_timeout 5s;
@@ -263,8 +289,8 @@ http {
         server_name ${SERVER_NAME};
 
         # ---- SSL Certificate Configuration ----
-        ssl_certificate ${SSL_CERT_PATH};
-        ssl_certificate_key ${SSL_KEY_PATH};
+        ssl_certificate ${ACME_FULLCHAIN_CERT_PATH};
+        ssl_certificate_key ${ACME_CERT_KEY_PATH};
 
 # ---- HTTP/3 Specific Settings ----
         # Advertise HTTP/3 support to browsers via Alt-Svc header
@@ -295,7 +321,7 @@ http {
     }
 }
 EOF
-echo "Nginx configuration updated based on your input."
+echo "Nginx configuration updated based on your input and generated SSL paths."
 echo "----------------------------------------"
 
 # --- Step 7: Nginx Systemd Service and start ---
