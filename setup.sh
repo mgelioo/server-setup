@@ -157,7 +157,7 @@ echo "----------------------------------------"
 # --- Step 6: Configure Nginx and obtain SSL Certificate ---
 echo "## Step 6: Configuring Nginx and obtaining SSL certificate..."
 
-read -p "Enter your Nginx server name (e.g., farhad.marfanet.com): " SERVER_NAME
+read -p "Enter your Nginx server name (e.g., sub.domain.com): " SERVER_NAME
 if [ -z "$SERVER_NAME" ]; then
     echo "Server name cannot be empty. Aborting Nginx configuration."
     exit 1
