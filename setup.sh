@@ -117,15 +117,15 @@ apt-get install -y gcc g++ libpcre3 libpcre3-dev zlib1g zlib1g-dev openssl libss
 echo "Nginx build dependencies installed."
 
 echo "Downloading Nginx source..."
-wget https://nginx.org/download/nginx-1.27.3.tar.gz || { echo "Error: Nginx download failed."; exit 1; }
+wget https://nginx.org/download/nginx-1.28.0.tar.gz || { echo "Error: Nginx download failed."; exit 1; }
 echo "Extracting Nginx source..."
-tar -xvf nginx-1.27.3.tar.gz || { echo "Error: Nginx extraction failed."; exit 1; }
+tar -xvf nginx-1.28.0.tar.gz || { echo "Error: Nginx extraction failed."; exit 1; }
 echo "Nginx source extracted to /root/nginx-1.27.3."
 echo "----------------------------------------"
 
 # --- Step 5: Configure, compile, and install Nginx ---
 echo "## Step 5: Configuring, compiling, and installing Nginx..."
-cd /root/nginx-1.27.3 || { echo "Error: Could not change to Nginx source directory."; exit 1; }
+cd /root/nginx-1.28.0 || { echo "Error: Could not change to Nginx source directory."; exit 1; }
 
 echo "Running Nginx configure script..."
 ./configure \
@@ -158,7 +158,7 @@ echo "----------------------------------------"
 # --- Step 6: Configure Nginx and obtain SSL Certificate ---
 echo "## Step 6: Configuring Nginx and obtaining SSL certificate..."
 
-read -p "Enter your Nginx server name (e.g., farhad.marfanet.com): " SERVER_NAME
+read -p "Enter your Nginx server name (e.g., sub.domain.com): " SERVER_NAME
 if [ -z "$SERVER_NAME" ]; then
     echo "Server name cannot be empty. Aborting Nginx configuration."
     exit 1
