@@ -50,17 +50,46 @@ cat > "$XRAY_CONFIG_PATH" << 'EOF'
     "error": "/var/log/xray/error.log",
     "access": "/var/log/xray/access.log"
   },
+  "dns": {
+    "servers": [
+      "8.8.8.8",
+      "8.8.4.4"
+    ]
+  },
+  "api": {
+    "tag": "api",
+    "listen": "127.0.0.1:10085",
+    "services": [
+      "StatsService",
+      "HandlerService",
+      "LoggerService"
+    ]
+  },
+  "policy": {
+    "levels": {
+      "0": {
+        "statsUserUplink": true,
+        "statsUserDownlink": true,
+        "statsUserOnline": true
+      }
+    },
+    "system": {
+"statsInboundUplink": true,
+      "statsInboundDownlink": true,
+      "statsOutboundUplink": true,
+      "statsOutboundDownlink": true
+    }
+  },
   "inbounds": [
     {
       "listen": "127.0.0.1",
-      "tag":"vless-in",
+      "tag": "vless-in",
       "port": 2000,
       "protocol": "vless",
       "settings": {
         "clients": [
-
         ],
-        "decryption": "none"
+"decryption": "none"
       },
       "streamSettings": {
         "network": "xhttp",
@@ -89,18 +118,16 @@ cat > "$XRAY_CONFIG_PATH" << 'EOF'
       }
     ]
   },
-  "outbounds": [
-    {
-      "protocol": "freedom",
-      "settings": {}
-    },
+  "outbounds": [   
     {
       "tag": "block",
       "protocol": "blackhole",
       "settings": {}
     }
-  ]
+  ],
+  "stats": {}
 }
+
 EOF
 echo "Xray configuration updated."
 echo "----------------------------------------"
@@ -451,47 +478,57 @@ function restart_xray {
 
 # --- Traffic Statistics Optimization ---
 
-# Fetches all user traffic statistics from Xray's API in a single query
-# and populates the global ALL_USER_TRAFFIC_STATS array.
+# Fetches all user traffic statistics from Xray's API by querying each user individually
+# and populates the global ALL_USER_TRAFFIC_STATS associative array.
 function get_all_user_traffic_stats {
     echo "Fetching all user traffic statistics from Xray..."
-
     # Reset the associative array before populating to ensure fresh data
     unset ALL_USER_TRAFFIC_STATS
     declare -g -A ALL_USER_TRAFFIC_STATS
 
-    # Query Xray API for all user traffic stats. Redirect stderr to /dev/null to suppress errors.
-    local raw_stats=$(/usr/local/bin/xray api statsquery --server=127.0.0.1:10085 -pattern "user>>>.*>>>traffic.*" -reset=false 2>/dev/null)
+    # Define the path to your Xray configuration file
+    local config_file="/usr/local/etc/xray/config.json"
+    local api_address="127.0.0.1:10085" # Make sure this matches your Xray API listen address
 
-    # Use awk to parse the raw stats. It splits lines by '>' or ':' and sums uplink/downlink per user.
-    echo "$raw_stats" | awk -F'[>:]' '
-        /^user/{ # Only process lines that start with "user"
-            user=$2;  # Extracts the email/name (e.g., "testuser1")
-            type=$4;  # Extracts "uplink" or "downlink"
-            bytes=$5; # Extracts the bytes string (e.g., " 12345")
-            gsub(/ /, "", bytes); # Remove leading space from the bytes string
+    # 1. Get all user emails from the Xray configuration
+    # Use jq to robustly parse the JSON and extract emails from the 'vless-in' inbound
+    local user_emails=$(jq -r '.inbounds[] | select(.tag == "vless-in") | .settings.clients[].email' "$config_file" 2>/dev/null)
 
-            if (type == "uplink") {
-                uplink_bytes[user] += bytes;
-            } else if (type == "downlink") {
-                downlink_bytes[user] += bytes;
-            }
-        }
-        END { # After processing all lines, print the total for each user
-            for (user in uplink_bytes) {
-                print user, (uplink_bytes[user] + downlink_bytes[user]);
-            }
-            # Also include users who might only have downlink stats (e.g., if uplink is 0)
-            for (user in downlink_bytes) {
-                if (!(user in uplink_bytes)) { # If user only has downlink stats (no uplink yet)
-                    print user, downlink_bytes[user];
-                }
-            }
-        }
-    ' | while IFS=$' ' read -r username total_bytes; do
+    # Check if user_emails variable is empty (no users found or config parsing failed)
+    if [ -z "$user_emails" ]; then
+        echo "Error: No users found in config.json under 'vless-in' or failed to parse config.json."
+        return 1 # Return with an error code
+    fi
+
+    # 2. Loop through each user email to query their specific traffic
+    for email in $user_emails; do
+        local uplink_bytes=0
+        local downlink_bytes=0
+
+        # Query uplink traffic for the current user
+        # Suppress stderr to avoid "gRPC unavailable" or similar messages if API is momentarily down
+        local raw_uplink_stat=$(/usr/local/bin/xray api statsquery --server="${api_address}" -pattern "user>>>${email}>>>traffic>>>uplink" -reset=false 2>/dev/null)
+        # Extract value using jq. Use // 0 as a default if the stat is not found (e.g., no traffic yet).
+        uplink_bytes=$(echo "$raw_uplink_stat" | jq -r '.stat[0].value // 0')
+
+        # Query downlink traffic for the current user
+        local raw_downlink_stat=$(/usr/local/bin/xray api statsquery --server="${api_address}" -pattern "user>>>${email}>>>traffic>>>downlink" -reset=false 2>/dev/null)
+        downlink_bytes=$(echo "$raw_downlink_stat" | jq -r '.stat[0].value // 0')
+
+        # Calculate total bytes for the user
+        local total_bytes=$(( uplink_bytes + downlink_bytes ))
+
         # Populate the global associative array
-        ALL_USER_TRAFFIC_STATS["$username"]="$total_bytes"
+        ALL_USER_TRAFFIC_STATS["$email"]="$total_bytes"
+
+        # Optional: Print verbose output for debugging/monitoring
+        # printf "  Processed user '%s': Uplink=%.2fMB, Downlink=%.2fMB, Total=%.2fMB\n" \
+        #     "$email" \
+        #     "$(echo "scale=2; $uplink_bytes / 1024 / 1024" | bc)" \
+        #     "$(echo "scale=2; $downlink_bytes / 1024 / 1024" | bc)" \
+        #     "$(echo "scale=2; $total_bytes / 1024 / 1024" | bc)"
     done
+
     echo "Traffic statistics fetch complete."
 }
 
