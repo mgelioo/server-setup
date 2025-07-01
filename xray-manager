@@ -1,0 +1,689 @@
+# --- Step 8: Install Xray User Manager script ---
+echo "## Step 8: Installing Xray User Manager script..."
+
+# Ensure the user database file exists
+touch "$XRAY_USER_DB_PATH" || { echo "Error: Could not create user database file."; exit 1; }
+
+# Write the Xray manager script - Using 'SCRIPTEOF' with quotes to prevent expansion
+cat > "$XRAY_MANAGER_SCRIPT_PATH" << 'SCRIPTEOF'
+#!/bin/bash
+
+# This script manages VLESS users for Xray, including adding, listing,
+# activating/deactivating, generating QR codes, and enforcing limits.
+
+
+# --- Configuration ---
+# Path to your Xray configuration file
+XRAY_CONFIG="/usr/local/etc/xray/config.json"
+# Path to the database file storing user UUIDs, names, expiration, and traffic limits
+USER_DB="/usr/local/etc/xray/user_database.txt"
+# The 'tag' of the VLESS inbound section in your Xray config.json that this script manages.
+# This must exactly match a "tag" field within an "inbounds" block in your Xray config.
+INBOUND_TAG="vless-in" # Default, adjust if your inbound tag is different.
+
+
+# --- QR CODE CONFIGURATION (IMPORTANT: EDIT THESE BASED ON YOUR SERVER'S PUBLIC DETAILS!) ---
+# This is the public IP address clients will connect to directly.
+# SERVER_ADDRESS="104.17.148.22" # This will be derived from your Nginx server_name
+# Automatically get server IP. Note: This might return internal IP if behind NAT.
+# It's safer to manually set SERVER_ADDRESS if you have a specific public IP.
+# Public IP lookup (can vary based on external service reliability)
+# SERVER_ADDRESS=$(curl -s ifconfig.me) # Use an external service
+# Or, if you know your public IP:
+SERVER_ADDRESS="$(hostname -I | awk '{print $1}')" # Tries to get primary IP, may be local.
+if [[ -z "$SERVER_ADDRESS" || "$SERVER_ADDRESS" == "127.0.0.1" ]]; then
+    echo "Warning: Could not automatically determine public IP. Please set SERVER_ADDRESS manually in the script."
+    echo "Falling back to placeholder 104.17.148.22. Edit $XRAY_MANAGER_SCRIPT_PATH to correct."
+    SERVER_ADDRESS="104.17.148.22"
+fi
+
+# This is the domain name used for TLS SNI (Server Name Indication) and HTTP Host headers.
+# This should match the domain on your TLS certificate and Nginx configuration.
+# DOMAIN_FOR_HOST_SNI="farhad.marfanet.com" # This will be derived from your Nginx config
+DOMAIN_FOR_HOST_SNI=$(grep 'server_name' /etc/nginx/nginx.conf | awk '{print $2}' | tr -d ';' | head -n 1)
+if [ -z "$DOMAIN_FOR_HOST_SNI" ]; then
+    echo "Warning: Could not automatically determine DOMAIN_FOR_HOST_SNI from Nginx config."
+    echo "Falling back to placeholder farhad.marfanet.com. Edit $XRAY_MANAGER_SCRIPT_PATH to correct."
+    DOMAIN_FOR_HOST_SNI="farhad.marfanet.com"
+fi
+
+
+# The public port Nginx listens on, which forwards to Xray. (Typically 443 for HTTPS)
+PUBLIC_PORT="443"
+
+# The specific path configured in your Xray streamSettings.xhttpSettings.path
+# This must exactly match the path in your Xray server configuration.
+VLESS_PATH="/xhttp7970"
+# ---------------------------------------------------------------------------------
+
+
+# Pre-encode VLESS_PATH for URI. Requires 'jq'. This ensures the path is URL-safe.
+VLESS_PATH_ENCODED=$(printf %s "${VLESS_PATH}" | jq -sRr @uri)
+
+# Global associative array to store all user traffic stats.
+# This is populated once to speed up operations like 'list_users'. Requires Bash 4.0+.
+declare -g -A ALL_USER_TRAFFIC_STATS
+
+
+# --- Helper Functions ---
+
+# Restarts the Xray service. Called after making changes to Xray config.
+function restart_xray {
+    echo "Restarting Xray service..."
+    systemctl restart xray
+    if [ $? -eq 0 ]; then
+        echo "Xray service restarted successfully."
+    else
+        echo "Error: Xray service restart failed. Check logs."
+    fi
+}
+
+# --- Traffic Statistics Optimization ---
+
+# Fetches all user traffic statistics from Xray's API by querying each user individually
+# and populates the global ALL_USER_TRAFFIC_STATS associative array.
+function get_all_user_traffic_stats {
+    echo "Fetching all user traffic statistics from Xray..."
+    # Reset the associative array before populating to ensure fresh data
+    unset ALL_USER_TRAFFIC_STATS
+    declare -g -A ALL_USER_TRAFFIC_STATS
+
+    # Define the path to your Xray configuration file
+    local config_file="/usr/local/etc/xray/config.json"
+    local api_address="127.0.0.1:10085" # Make sure this matches your Xray API listen address
+
+    # 1. Get all user emails from the Xray configuration
+    # Use jq to robustly parse the JSON and extract emails from the 'vless-in' inbound
+    local user_emails=$(jq -r '.inbounds[] | select(.tag == "vless-in") | .settings.clients[].email' "$config_file" 2>/dev/null)
+
+    # Check if user_emails variable is empty (no users found or config parsing failed)
+    if [ -z "$user_emails" ]; then
+        echo "Error: No users found in config.json under 'vless-in' or failed to parse config.json."
+        return 1 # Return with an error code
+    fi
+
+    # 2. Loop through each user email to query their specific traffic
+    for email in $user_emails; do
+        local uplink_bytes=0
+        local downlink_bytes=0
+
+        # Query uplink traffic for the current user
+        # Suppress stderr to avoid "gRPC unavailable" or similar messages if API is momentarily down
+        local raw_uplink_stat=$(/usr/local/bin/xray api statsquery --server="${api_address}" -pattern "user>>>${email}>>>traffic>>>uplink" -reset=false 2>/dev/null)
+        # Extract value using jq. Use // 0 as a default if the stat is not found (e.g., no traffic yet).
+        uplink_bytes=$(echo "$raw_uplink_stat" | jq -r '.stat[0].value // 0')
+
+        # Query downlink traffic for the current user
+        local raw_downlink_stat=$(/usr/local/bin/xray api statsquery --server="${api_address}" -pattern "user>>>${email}>>>traffic>>>downlink" -reset=false 2>/dev/null)
+        downlink_bytes=$(echo "$raw_downlink_stat" | jq -r '.stat[0].value // 0')
+
+        # Calculate total bytes for the user
+        local total_bytes=$(( uplink_bytes + downlink_bytes ))
+
+        # Populate the global associative array
+        ALL_USER_TRAFFIC_STATS["$email"]="$total_bytes"
+
+        # Optional: Print verbose output for debugging/monitoring
+        # printf "  Processed user '%s': Uplink=%.2fMB, Downlink=%.2fMB, Total=%.2fMB\n" \
+        #     "$email" \
+        #     "$(echo "scale=2; $uplink_bytes / 1024 / 1024" | bc)" \
+        #     "$(echo "scale=2; $downlink_bytes / 1024 / 1024" | bc)" \
+        #     "$(echo "scale=2; $total_bytes / 1024 / 1024" | bc)"
+    done
+
+    echo "Traffic statistics fetch complete."
+}
+
+
+# --- QR CODE & URI FUNCTIONS ---
+
+# Generates a VLESS URI based on provided user details and global config.
+# Parameters: $1 = UUID, $2 = Client Name (email)
+function generate_vless_uri {
+    local uuid=$1
+    local name=$2
+    local uri=""
+
+    # Encode the client name for the URI's remark field (e.g., spaces to %20).
+    local remark_encoded=$(printf %s "$name" | jq -sRr @uri)
+
+    # Construct the VLESS URI with all specified parameters.
+    # The 'type=xhttp' is used as confirmed by your working client URL.
+    uri="vless://${uuid}@${SERVER_ADDRESS}:${PUBLIC_PORT}?mode=auto&path=${VLESS_PATH_ENCODED}&security=tls&alpn=h2&encryption=none&host=${DOMAIN_FOR_HOST_SNI}&fp=chrome&type=xhttp&sni=${DOMAIN_FOR_HOST_SNI}#${remark_encoded}"
+    echo "$uri"
+}
+
+# Displays the VLESS URI and generates a QR code in the terminal if qrencode is installed.
+# Parameter: $1 = VLESS URI string
+function display_qr_code {
+    local uri=$1
+
+    echo "----------------------------------------"
+    echo "VLESS Configuration Link:"
+    echo "$uri"
+    echo "----------------------------------------"
+
+    # Check if qrencode command is available
+    if command -v qrencode &> /dev/null; then
+        echo "QR Code for scanning (requires UTF-8 terminal support):"
+        qrencode -t UTF8 "$uri" # Generates a QR code readable in UTF-8 terminals
+    else
+        echo "Warning: 'qrencode' is not installed. Cannot display QR code in terminal."
+        echo "Please install it using: sudo apt install qrencode (Debian/Ubuntu) or sudo yum install qrencode (CentOS/RHEL)"
+    fi
+    echo "----------------------------------------"
+}
+
+
+# --- User Management Functions ---
+
+# Adds a new VLESS user to Xray configuration and the user database.
+function add_user {
+    read -p "Enter client name (no spaces, e.g., user1): " client_name
+    if [ -z "$client_name" ]; then
+        echo "Client name cannot be empty. Aborting."
+        return
+    fi
+    # Validate client_name: alphanumeric and underscores only, no spaces.
+    if [[ "$client_name" =~ [[:space:]] || ! "$client_name" =~ ^[a-zA-Z0-9_]+$ ]]; then
+        echo "Invalid client name. Please use alphanumeric characters and underscores only, no spaces."
+        return
+    fi
+
+    # Check if client name already exists in the user database.
+    if grep -q ";$client_name;" "$USER_DB"; then
+        echo "Error: User with name '$client_name' already exists. Please choose a different name."
+        return
+    fi
+
+    read -p "Enter usage duration in days (e.g., 30): " duration_days
+    if ! [[ "$duration_days" =~ ^[0-9]+$ ]] || [ "$duration_days" -le 0 ]; then
+        echo "Invalid duration. Please enter a positive number of days."
+        return
+    fi
+
+    read -p "Enter traffic limit in GB (e.g., 20, use 0 for unlimited): " traffic_limit_gb
+    if ! [[ "$traffic_limit_gb" =~ ^[0-9]+$ ]] || [ "$traffic_limit_gb" -lt 0 ]; then
+        echo "Invalid traffic limit. Please enter a non-negative number."
+        return
+    fi
+
+    # Generate a new UUID for the user. Requires 'uuid-runtime' package (for uuidgen).
+    new_uuid=$(uuidgen)
+
+    # Calculate expiration date as a Unix timestamp (seconds since epoch).
+    expiration_timestamp=$(date -d "+$duration_days days" +%s)
+
+    echo "----------------------------------------"
+    echo "Adding new user details:"
+    echo "  Name: $client_name"
+    echo "  UUID: $new_uuid"
+    echo "  Expires on: $(date -d @$expiration_timestamp)"
+    echo "  Traffic Limit: ${traffic_limit_gb}GB"
+    echo "----------------------------------------"
+
+    # Append user data to the database file.
+    echo "$new_uuid;$client_name;$expiration_timestamp;$traffic_limit_gb;active" | sudo tee -a "$USER_DB" > /dev/null
+
+    # Add user to Xray config.json using jq.
+    # First, check if the specified inbound tag exists in the Xray config.
+    if ! sudo jq -e '.inbounds[] | select(.tag == "'"$INBOUND_TAG"'")' "$XRAY_CONFIG" > /dev/null; then
+        echo "Error: Inbound with tag '$INBOUND_TAG' not found in Xray config. Please check your config.json."
+        # If inbound is not found, remove the user from the database as Xray won't use them.
+        sudo sed -i "/^$new_uuid;/d" "$USER_DB"
+        return
+    fi
+
+    # Use jq to append a new client entry to the specified inbound's clients array.
+    sudo jq --arg uuid "$new_uuid" --arg email "$client_name" \
+        '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients) |= . + [{"id": $uuid, "email": $email, "flow": ""}]' \
+        "$XRAY_CONFIG" > tmp.json && sudo mv tmp.json "$XRAY_CONFIG"
+
+    if [ $? -eq 0 ]; then
+        echo "User '$client_name' added successfully to Xray config."
+        restart_xray # Restart Xray to apply config changes.
+        # Generate and display QR code for the new user.
+        local vless_uri=$(generate_vless_uri "$new_uuid" "$client_name")
+        display_qr_code "$vless_uri"
+    else
+        echo "Error: Failed to add user to Xray config."
+        # If Xray config update fails, remove the user from the database to keep consistency.
+        sudo sed -i "/^$new_uuid;/d" "$USER_DB"
+    fi
+}
+
+# ---
+## Function to delete an existing user
+# ---
+function delete_user {
+    echo "Listing all users..."
+    list_users # Show current users for selection
+    read -p "Enter the **UUID** of the user you want to DELETE permanently: " user_uuid_to_delete
+
+    if [ -z "$user_uuid_to_delete" ]; then
+        echo "No UUID entered. Aborting deletion."
+        return
+    fi
+
+    # Retrieve user record from the database.
+    user_record=$(grep "^$user_uuid_to_delete;" "$USER_DB")
+    if [ -z "$user_record" ]; then
+        echo "Error: User with UUID $user_uuid_to_delete not found in database. Nothing to delete."
+        return
+    fi
+
+    local client_name=$(echo "$user_record" | cut -d';' -f2)
+
+    echo "----------------------------------------"
+    echo "WARNING: You are about to permanently delete user '$client_name' (UUID: $user_uuid_to_delete)."
+    read -p "Are you sure you want to proceed? (yes/no): " confirm_delete
+    echo "----------------------------------------"
+
+    if [[ "$confirm_delete" != "yes" ]]; then
+        echo "Deletion aborted by user."
+        return
+    fi
+
+    echo "Proceeding with deletion of user '$client_name' (UUID: $user_uuid_to_delete)..."
+
+    # 1. Remove user from Xray config.json
+    # Check if the inbound exists before attempting to modify.
+    if ! sudo jq -e '.inbounds[] | select(.tag == "'"$INBOUND_TAG"'")' "$XRAY_CONFIG" > /dev/null; then
+        echo "Warning: Inbound with tag '$INBOUND_TAG' not found in Xray config. User cannot be removed from config."
+    else
+        # Use jq to filter out the client with the specified UUID.
+        sudo jq '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients) |= map(select(.id != "'"$user_uuid_to_delete"'"))' \
+            "$XRAY_CONFIG" > tmp.json && sudo mv tmp.json "$XRAY_CONFIG"
+        if [ $? -eq 0 ]; then
+            echo "User '$client_name' removed from Xray config."
+        else
+            echo "Error: Failed to remove user '$client_name' from Xray config."
+            echo "Manual intervention might be needed to clean up $XRAY_CONFIG."
+        fi
+    fi
+
+    # 2. Remove user from the database file
+    local temp_db=$(mktemp)
+    grep -v "^$user_uuid_to_delete;" "$USER_DB" | sudo tee "$temp_db" > /dev/null
+    sudo mv "$temp_db" "$USER_DB"
+
+    if grep -q "^$user_uuid_to_delete;" "$USER_DB"; then
+        echo "Error: Failed to remove user '$client_name' from database."
+    else
+        echo "User '$client_name' removed from database."
+    fi
+
+    restart_xray # Restart Xray to apply config changes.
+    echo "User '$client_name' has been permanently deleted."
+}
+
+
+# Deactivates a user by removing them from Xray config and updating their status in the database.
+function deactivate_user {
+    echo "Listing all users..."
+    list_users # Show current users for selection, now faster due to optimization.
+    read -p "Enter the UUID of the user you want to DEACTIVATE: " user_uuid
+
+
+    if [ -z "$user_uuid" ]; then
+        echo "No UUID entered. Aborting."
+        return
+    fi
+
+    # Retrieve user record from the database.
+    user_record=$(grep "^$user_uuid;" "$USER_DB")
+    if [ -z "$user_record" ]; then
+        echo "Error: User with UUID $user_uuid not found in database."
+        return
+    fi
+
+    local user_status=$(echo "$user_record" | cut -d';' -f5)
+    local client_name=$(echo "$user_record" | cut -d';' -f2)
+
+    # Check if the user is already inactive.
+    if [ "$user_status" != "active" ]; then
+        echo "User '$client_name' is already inactive (Status: $user_status). No action taken."
+        return
+    fi
+
+
+    echo "Deactivating user '$client_name' (UUID: $user_uuid)..."
+
+
+    # 1. Remove user from Xray config.json.
+    # Check if the inbound exists before attempting to modify.
+    if ! sudo jq -e '.inbounds[] | select(.tag == "'"$INBOUND_TAG"'")' "$XRAY_CONFIG" > /dev/null; then
+        echo "Warning: Inbound with tag '$INBOUND_TAG' not found in Xray config. User cannot be removed from config."
+    else
+        # Use jq to filter out the client with the specified UUID.
+        sudo jq '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients) |= map(select(.id != "'"$user_uuid"'"))' \
+            "$XRAY_CONFIG" > tmp.json && sudo mv tmp.json "$XRAY_CONFIG"
+        if [ $? -eq 0 ]; then
+            echo "User '$client_name' removed from Xray config."
+        else
+            echo "Error: Failed to remove user from Xray config."
+            # Decide here if you want to abort or continue updating DB despite config failure.
+        fi
+    fi
+
+    # 2. Update user status in the database to 'deactivated'.
+    local temp_db=$(mktemp)
+    # Use awk to find the line with the user's UUID and change its status field.
+    awk -F';' -v uuid="$user_uuid" 'BEGIN{OFS=";"} {if ($1 == uuid) {$5="deactivated"; print} else {print}}' "$USER_DB" | sudo tee "$temp_db" > /dev/null
+    sudo mv "$temp_db" "$USER_DB"
+
+    echo "User has been deactivated in the database."
+    restart_xray # Restart Xray to apply config changes.
+}
+
+
+# Activates a user by adding them back to Xray config and updating their status in the database.
+function activate_user {
+    echo "Listing all users..."
+    list_users # Show current users for selection, now faster.
+    read -p "Enter the UUID of the user you want to ACTIVATE: " user_uuid
+
+    if [ -z "$user_uuid" ]; then
+        echo "No UUID entered. Aborting."
+        return
+    fi
+
+    # Retrieve user record from the database.
+    user_record=$(grep "^$user_uuid;" "$USER_DB")
+    if [ -z "$user_record" ]; then
+        echo "Error: User with UUID $user_uuid not found in database."
+        return
+    fi
+
+    local user_status=$(echo "$user_record" | cut -d';' -f5)
+    local client_name=$(echo "$user_record" | cut -d';' -f2)
+    local user_uuid_from_db=$(echo "$user_record" | cut -d';' -f1) # Ensure we use the UUID from DB for jq.
+
+    # Check if the user is in a state that can be activated.
+    if [ "$user_status" != "deactivated" ] && [ "$user_status" != "expired" ] && [ "$user_status" != "over_limit" ]; then
+        echo "User '$client_name' is not in a deactivated/expired/over_limit state (Status: $user_status). Cannot activate."
+        return
+    fi
+
+    echo "Activating user '$client_name' (UUID: $user_uuid)..."
+
+    # 1. Add user back to Xray config.json.
+    # Check if the inbound exists.
+    if ! sudo jq -e '.inbounds[] | select(.tag == "'"$INBOUND_TAG"'")' "$XRAY_CONFIG" > /dev/null; then
+        echo "Warning: Inbound with tag '$INBOUND_TAG' not found in Xray config. User cannot be added to config."
+    else
+        # Prevent adding duplicate clients to Xray config.
+        if sudo jq -e '.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients[] | select(.id == "'"$user_uuid"'")' "$XRAY_CONFIG" > /dev/null; then
+            echo "User '$client_name' (UUID: $user_uuid) is already present in Xray config. Skipping config update."
+        else
+            # Add the client back to the Xray config.
+            sudo jq --arg uuid "$user_uuid_from_db" --arg email "$client_name" \
+                '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients) |= . + [{"id": $uuid, "email": $email, "flow": ""}]' \
+                "$XRAY_CONFIG" > tmp.json && sudo mv tmp.json "$XRAY_CONFIG"
+            if [ $? -eq 0 ]; then
+                echo "User '$client_name' added back to Xray config."
+            else
+                echo "Error: Failed to add user back to Xray config."
+                # Decide here if you want to abort or continue updating DB.
+            fi
+        fi
+    fi
+
+    # 2. Update user status in the database back to 'active'.
+    local temp_db=$(mktemp)
+    awk -F';' -v uuid="$user_uuid" 'BEGIN{OFS=";"} {if ($1 == uuid) {$5="active"; print} else {print}}' "$USER_DB" | sudo tee "$temp_db" > /dev/null
+    sudo mv "$temp_db" "$USER_DB"
+
+    echo "User has been activated in the database."
+    restart_xray # Restart Xray to apply config changes.
+    # Display QR code after user is activated.
+    local vless_uri=$(generate_vless_uri "$user_uuid_from_db" "$client_name")
+    display_qr_code "$vless_uri"
+}
+
+# Lists all users from the database, showing their status, expiration, and traffic usage.
+function list_users {
+    echo "--------------------------------------------------------------------------------------------------------------------------------------"
+    printf "%-38s %-15s %-25s %-15s %-15s %-15s %-10s\n" "UUID" "Name" "Expires On" "Time Left" "Traffic Limit" "Traffic Used" "Status"
+    echo "--------------------------------------------------------------------------------------------------------------------------------------"
+
+    if [ ! -s "$USER_DB" ]; then
+        echo "No users found in the database."
+        return
+    fi
+
+    local current_time=$(date +%s)
+
+    # Optimize: Fetch all user traffic stats once before looping through users.
+    get_all_user_traffic_stats
+
+    # Read each user record from the database.
+    while IFS=';' read -r uuid name expires_at limit status; do
+        local expires_display=$(date -d @$expires_at '+%Y-%m-%d %H:%M:%S')
+
+        # --- Calculate Time Left ---
+        local time_left_display=""
+        local display_status="$status" # Default display status is the one from DB
+
+        if [[ "$status" == "active" ]]; then
+            local remaining_seconds=$((expires_at - current_time))
+            if [ "$remaining_seconds" -le 0 ]; then
+                time_left_display="Expired"
+                display_status="EXPIRED" # Override for active but expired users
+            else
+                local days=$((remaining_seconds / 86400))
+                local hours=$(( (remaining_seconds % 86400) / 3600 ))
+                local minutes=$(( (remaining_seconds % 3600) / 60 ))
+                if [ "$days" -gt 0 ]; then
+                    time_left_display="${days}d ${hours}h"
+                elif [ "$hours" -gt 0 ]; then
+                    time_left_display="${hours}h ${minutes}m"
+                elif [ "$minutes" -gt 0 ]; then
+                    time_left_display="<1m"
+                fi
+            fi
+        else
+            time_left_display="N/A" # Not Applicable for inactive users
+        fi
+
+        # --- Calculate Traffic Used ---
+        local traffic_used_gb_display="N/A"
+        local traffic_limit_gb_display="${limit}GB"
+
+        # Retrieve total traffic bytes from the pre-fetched global array
+        local total_traffic_bytes=${ALL_USER_TRAFFIC_STATS["$name"]:-0} # Defaults to 0 if no stats for user
+
+        # Only process traffic if stats are available or it's an active/relevant user
+        if [[ "$total_traffic_bytes" -gt 0 || "$status" == "active" || "$status" == "expired" || "$status" == "over_limit" ]]; then
+            # Convert bytes to GB for display. Requires 'bc'.
+            traffic_used_gb_display=$(echo "scale=2; $total_traffic_bytes / 1073741824" | bc)GB
+
+            if [ "$limit" -gt 0 ]; then # If a traffic limit is set (not 0/unlimited)
+                local limit_bytes=$((limit * 1073741824))
+
+                if [ "$total_traffic_bytes" -ge "$limit_bytes" ]; then
+                    # If active and over limit, update display_status
+                    if [[ "$status" == "active" ]]; then
+                        display_status="OVER_LIMIT"
+                    fi
+                fi
+            else # Traffic limit is 0 (unlimited)
+                traffic_limit_gb_display="UNLIMITED"
+            fi
+        fi
+
+        # Print formatted user information.
+        printf "%-38s %-15s %-25s %-15s %-15s %-15s %-10s\n" \
+               "$uuid" "$name" "$expires_display" "$time_left_display" \
+               "$traffic_limit_gb_display" "$traffic_used_gb_display" "$display_status"
+    done < "$USER_DB" # Loop reads from the user database file.
+    echo "--------------------------------------------------------------------------------------------------------------------------------------"
+    echo "Note: 'EXPIRED' or 'OVER_LIMIT' status in this list reflects real-time checks, and will be updated in DB by 'Check/Enforce Limits'."
+    echo "      Traffic usage requires Xray's statistics API to be active. Traffic is calculated as uplink + downlink."
+}
+
+
+# Checks for expired users and those who exceeded their traffic limits, then deactivates them.
+# Can be run periodically (e.g., via cron job).
+function check_limits {
+    echo "Running periodic check for expired users and traffic limits..."
+
+    local current_time=$(date +%s)
+    local temp_db=$(mktemp) # Create a temporary file for database updates.
+    local changes_made=false # Flag to indicate if Xray restart is needed.
+
+    # Optimization: Fetch all user traffic stats once for efficiency in this function too.
+    get_all_user_traffic_stats
+
+    # Read each user from the database.
+    while IFS=';' read -r uuid name expires_at limit status; do
+        local client_email="${name}"
+        local original_status=$status # Store original status to detect changes.
+
+        local current_user_config_present=false
+        # Check if the user's UUID is currently in the Xray config's clients list.
+        if sudo jq -e '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients[] | select(.id == "'"$uuid"'"))' "$XRAY_CONFIG" > /dev/null; then
+            current_user_config_present=true
+        fi
+
+        # Only process users that are currently 'active' for expiration/limit checks.
+        if [[ "$status" == "active" ]]; then
+            # 1. Check for expiration
+            if [[ $current_time -gt $expires_at ]]; then
+                echo "User '$name' (UUID: $uuid) has expired. Changing status to 'expired'."
+                status="expired"
+                changes_made=true
+            else
+                # 2. Check traffic limit (only if not expired)
+                # Use pre-fetched stats for faster lookup.
+                local total_traffic=${ALL_USER_TRAFFIC_STATS["$name"]:-0} # Defaults to 0 if no stats found.
+
+                local limit_bytes=$((limit * 1073741824)) # Convert GB to Bytes.
+
+                if [ "$limit" -gt 0 ]; then # Only check if a limit is set (limit > 0 GB).
+                    echo "User: $name, Traffic Used: $(echo "scale=2; $total_traffic / 1073741824" | bc)GB, Limit: ${limit}GB"
+                    if [[ $total_traffic -ge $limit_bytes ]]; then # Check if total traffic is greater than or equal to limit.
+                        echo "User '$name' (UUID: $uuid) has exceeded their traffic limit. Changing status to 'over_limit'."
+                        status="over_limit"
+                        changes_made=true
+                    fi
+                else
+                    echo "User: $name, Traffic Used: $(echo "scale=2; $total_traffic / 1073741824" | bc)GB, Limit: UNLIMITED"
+                fi
+            fi
+        fi
+
+        # Logic to remove users from Xray config if their status changed from active
+        # OR if they are already in an inactive state (expired, over_limit, deactivated) but still in config.
+        if [[ ("$original_status" == "active" && "$status" != "active") || \
+              (("$status" == "expired" || "$status" == "over_limit" || "$status" == "deactivated") && "$current_user_config_present" == "true") ]]; then
+
+            echo "Removing user '$name' (UUID: $uuid) from Xray config due to status change or persistent inactive status."
+            sudo jq '(.inbounds[] | select(.tag == "'"$INBOUND_TAG"'").settings.clients) |= map(select(.id != "'"$uuid"'"))' "$XRAY_CONFIG" > tmp.json && sudo mv tmp.json "$XRAY_CONFIG"
+            if [ $? -eq 0 ]; then
+                echo "User '$name' removed from Xray config successfully."
+                changes_made=true
+            else
+                echo "Error: Failed to remove user '$name' from Xray config."
+            fi
+        fi
+
+        # Write the (potentially updated) user record to the temporary database file.
+        echo "$uuid;$name;$expires_at;$limit;$status" >> "$temp_db"
+
+    done < "$USER_DB" # Loop reads from the user database file.
+
+    # Overwrite the main user database with the updated temporary one.
+    sudo mv "$temp_db" "$USER_DB"
+
+    if [ "$changes_made" = true ]; then
+        restart_xray # Restart Xray if any config changes were made.
+    else
+        echo "No changes needed for Xray config."
+    fi
+}
+
+
+# Generates and displays a QR code for an existing user.
+function generate_qr_for_user {
+    echo "Listing all users..."
+    list_users # Show current users for selection, now faster.
+    read -p "Enter the UUID of the user for whom you want to generate a QR code: " user_uuid
+
+    if [ -z "$user_uuid" ]; then
+        echo "No UUID entered. Aborting."
+        return
+    fi
+
+    # Retrieve the user's record from the database.
+    local user_record=$(grep "^$user_uuid;" "$USER_DB")
+    if [ -z "$user_record" ]; then
+        echo "Error: User with UUID $user_uuid not found in database."
+        return
+    fi
+
+    local uuid=$(echo "$user_record" | cut -d';' -f1)
+    local client_name=$(echo "$user_record" | cut -d';' -f2)
+
+    echo "Generating QR for user '$client_name' (UUID: $uuid)..."
+    local vless_uri=$(generate_vless_uri "$uuid" "$client_name")
+    display_qr_code "$vless_uri"
+}
+
+
+# --- Argument handling for cron or direct calls ---
+# This allows calling specific functions directly from the command line or a cron job.
+# Example: sudo /usr/local/bin/xray_manager.sh check_limits
+if [ "$1" == "check_limits" ]; then
+    check_limits
+    exit 0
+fi
+
+
+# --- Main Menu ---
+# This is the interactive menu presented when the script is run without arguments.
+echo "Xray User Manager"
+echo "-----------------"
+PS3="Select an option: "
+options=("Add User" "Delete User" "List Users" "Deactivate User" "Activate User" "Generate QR for User" "Check/Enforce Limits" "Quit")
+select opt in "${options[@]}"
+do
+    case $opt in
+        "Add User")
+            add_user
+            ;;
+        "Delete User")
+            delete_user
+            ;;
+        "List Users")
+            list_users
+            ;;
+        "Deactivate User")
+            deactivate_user
+            ;;
+        "Activate User")
+            activate_user
+            ;;
+        "Generate QR for User")
+            generate_qr_for_user
+            ;;
+        "Check/Enforce Limits")
+            check_limits
+            ;;
+        "Quit")
+            echo "Exiting Xray User Manager. Goodbye!"
+            break # Exit the select loop
+            ;;
+        *) echo "Invalid option \$REPLY";; # Handle invalid input
+    esac
+    echo # Newline for better readability after each action
+done
+SCRIPTEOF
+chmod +x "$XRAY_MANAGER_SCRIPT_PATH" || { echo "Error: Could not make Xray manager script executable."; exit 1; }
+echo "Xray User Manager script saved to $XRAY_MANAGER_SCRIPT_PATH and made executable."
+echo "You can now run it by typing: xray-manager"
+echo "----------------------------------------"
+
+echo "--- All setup steps completed successfully! ---"
+echo "Remember to open ports 80 (TCP) and 443 (TCP/UDP) in your firewall if they are not already open."
+echo "You can manage Xray users by simply typing: xray-manager"
